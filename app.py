@@ -108,15 +108,15 @@ def build_summary_message(group_id):
     if full_team:
         lines.append("✅ 可以開團的日期：")
         for date_str, count, names in full_team:
-            lines.append(f"  📅 {date_str}（{count}人）")
-            lines.append(f"     👥 {' / '.join(names)}")
+            lines.append(f"  {date_str}（{count}人）")
+            lines.append(f"     {' / '.join(names)}")
         lines.append("")
     if short_team:
         lines.append("⚠️ 人數不足的日期：")
         for date_str, count, names in short_team:
             need = MIN_PLAYERS - count
-            lines.append(f"  📅 {date_str}（{count}人，還差 {need} 人）")
-            lines.append(f"     👥 {' / '.join(names)}")
+            lines.append(f"  {date_str}（{count}人，還差 {need} 人）")
+            lines.append(f"     {' / '.join(names)}")
     return "\n".join(lines)
 
 
