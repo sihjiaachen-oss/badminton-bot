@@ -1,0 +1,15 @@
+name: Daily Badminton Reminder
+
+on:
+  schedule:
+    - cron: '0 3 * * *'  # 台灣時間早上 11 點（UTC+8，所以 UTC 是 03:00）
+  workflow_dispatch:  # 允許手動觸發測試
+
+jobs:
+  remind:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send reminder to LINE group
+        run: |
+          curl -X POST https://badminton-bot-fod0.onrender.com/remind \
+            -H "X-Remind-Secret: ${{ secrets.REMIND_SECRET }}"
