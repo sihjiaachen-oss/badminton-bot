@@ -2,16 +2,17 @@ import os
 import re
 from datetime import datetime
 from collections import defaultdict
-from flask import Flask, request, abort
+from flask import Flask, request, abort, jsonify
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, ReplyMessageRequest, TextMessage
+from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, ReplyMessageRequest, PushMessageRequest, TextMessage
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
 app = Flask(__name__)
 
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '')
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '')
+GROUP_ID = os.environ.get('LINE_GROUP_ID', '')
 
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
@@ -19,11 +20,42 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 schedule_data = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
 fee_data = defaultdict(lambda: defaultdict(dict))
 MIN_PLAYERS = 4
-COURT_FEE_PER_HOUR = 550
+COURT_FEE_NORMAL = 550
+COURT_FEE_DISCOUNT = 500
+
+# 週六週日優惠時段（開始時間, 結束時間）
+DISCOUNT_SLOTS = [
+    (1200, 1400),
+    (1800, 2000),
+    (2000, 2200),
+]
 
 def get_current_month_key():
     now = datetime.now()
     return f"{now.year}-{now.month:02d}"
+
+def is_discount_slot(date_str, start_str, end_str):
+    """判斷是否為週六週日優惠時段"""
+    now = datetime.now()
+    month, day = date_str.split('/')
+    try:
+        dt = datetime(now.year, int(month), int(day))
+    except ValueError:
+        return False
+
+    # 只有週六(5)、週日(6)才有優惠
+    if dt.weekday() not in (5, 6):
+        return False
+
+    # 把時間轉成數字比對
+    start_int = int(start_str.replace(':', ''))
+    end_int = int(end_str.replace(':', ''))
+
+    for slot_start, slot_end in DISCOUNT_SLOTS:
+        if start_int == slot_start and end_int == slot_end:
+            return True
+
+    return False
 
 def parse_dates(text):
     dates = []
@@ -127,9 +159,10 @@ def build_summary_message(group_id):
 def build_fee_message(group_id, month_key, results):
     lines = ["💰 場地費用結算\n"]
     for r in results:
-        lines.append(f"{r['date']}")
+        discount_tag = "（優惠時段）" if r['is_discount'] else ""
+        lines.append(f"{r['date']}{discount_tag}")
         lines.append(f"時間：{r['start']} - {r['end']}（{r['hours_display']}）")
-        lines.append(f"場地費：{r['total']}元")
+        lines.append(f"場地費：{r['total']}元（{r['rate']}元/小時）")
         lines.append(f"出席（{len(r['names'])}人）：{' / '.join(r['names'])}")
         lines.append(f"每人：{r['per_person']}元")
         lines.append("")
@@ -186,7 +219,10 @@ def handle_fee_command(event, group_id, text):
             errors.append(f"{date_str} 沒有人登記出席")
             continue
 
-        total = int(COURT_FEE_PER_HOUR * hours)
+        # 判斷是否優惠時段
+        discount = is_discount_slot(date_str, start_fmt, end_fmt)
+        rate = COURT_FEE_DISCOUNT if discount else COURT_FEE_NORMAL
+        total = int(rate * hours)
         per_person = int(total / len(names))
 
         if hours == int(hours):
@@ -205,6 +241,8 @@ def handle_fee_command(event, group_id, text):
             'total': total,
             'per_person': per_person,
             'names': names,
+            'is_discount': discount,
+            'rate': rate,
         })
 
     if not entries and errors:
@@ -218,7 +256,6 @@ def handle_fee_command(event, group_id, text):
         }
 
     msg = build_fee_message(group_id, month_key, entries)
-
     if errors:
         msg += "\n\n⚠️ 以下日期無法處理：\n" + "\n".join(errors)
 
@@ -262,6 +299,42 @@ def reply(reply_token, text):
                 messages=[TextMessage(text=text)]
             )
         )
+
+def push_message(group_id, text):
+    with ApiClient(configuration) as api_client:
+        api = MessagingApi(api_client)
+        api.push_message_with_http_info(
+            PushMessageRequest(
+                to=group_id,
+                messages=[TextMessage(text=text)]
+            )
+        )
+
+@app.route("/remind", methods=['POST'])
+def remind():
+    secret = request.headers.get('X-Remind-Secret', '')
+    if secret != os.environ.get('REMIND_SECRET', ''):
+        abort(403)
+
+    now = datetime.now()
+    today = f"{now.month}/{now.day}"
+    month_key = get_current_month_key()
+    group_id = GROUP_ID
+
+    if not group_id:
+        return jsonify({"status": "no group_id set"}), 400
+
+    players = schedule_data[group_id][month_key].get(today, {})
+
+    if not players:
+        return jsonify({"status": "no players today"}), 200
+
+    names = list(players.values())
+    mention_str = " ".join([f"@{name}" for name in names])
+    msg = f"🏸 今天 {today} 要打球囉！\n出席：{' / '.join(names)}\n\n{mention_str}"
+
+    push_message(group_id, msg)
+    return jsonify({"status": "sent", "date": today, "players": names}), 200
 
 @app.route("/callback", methods=['POST'])
 def callback():
