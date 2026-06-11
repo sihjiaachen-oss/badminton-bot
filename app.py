@@ -19,9 +19,11 @@ handler = WebhookHandler(LINE_CHANNEL_SECRET)
 schedule_data = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
 MIN_PLAYERS = 4
 
+
 def get_current_month_key():
     now = datetime.now()
     return f"{now.year}-{now.month:02d}"
+
 
 def parse_dates(text):
     dates = []
@@ -29,7 +31,6 @@ def parse_dates(text):
     current_year = now.year
     current_month = now.month
 
-    # 格式一：「6月 3/13/17」或「6月3/13/17」- 指定月份後列日期
     cn_month_match = re.search(r'(\d{1,2})月\s*(\d{1,2}(?:[/、,]\d{1,2})*)', text)
     if cn_month_match:
         month = int(cn_month_match.group(1))
@@ -43,7 +44,6 @@ def parse_dates(text):
                 pass
         return list(dict.fromkeys(dates))
 
-    # 格式二：「6/3、6/13」每個日期都帶月份
     slash_pairs = re.findall(r'(\d{1,2})/(\d{1,2})', text)
     for m, d in slash_pairs:
         try:
@@ -54,7 +54,6 @@ def parse_dates(text):
     if dates:
         return list(dict.fromkeys(dates))
 
-    # 格式三：純數字，補當月月份
     pure_nums = re.findall(r'(?<!\d)(\d{1,2})(?!\d)', text)
     for d in pure_nums:
         day = int(d)
@@ -67,6 +66,7 @@ def parse_dates(text):
 
     return list(dict.fromkeys(dates))
 
+
 def get_user_display_name(user_id, group_id=None):
     try:
         with ApiClient(configuration) as api_client:
@@ -78,6 +78,7 @@ def get_user_display_name(user_id, group_id=None):
             return profile.display_name
     except Exception:
         return f"用戶_{user_id[-4:]}"
+
 
 def build_summary_message(group_id):
     month_key = get_current_month_key()
@@ -118,6 +119,7 @@ def build_summary_message(group_id):
             lines.append(f"     👥 {' / '.join(names)}")
     return "\n".join(lines)
 
+
 def reply(reply_token, text):
     with ApiClient(configuration) as api_client:
         api = MessagingApi(api_client)
@@ -127,6 +129,7 @@ def reply(reply_token, text):
                 messages=[TextMessage(text=text)]
             )
         )
+
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -138,11 +141,12 @@ def callback():
         abort(400)
     return 'OK'
 
+
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     if event.source.type != 'group':
         reply(event.reply_token,
-              "🏸 羽球出團小幫手\n\n請將我加入羽球群組使用！\n\n群組內指令：\n• 以下日期我可以 6月 3/13/17 → 登記可打日期\n• 查詢出團 → 查看目前統計\n• 取消日期 6月 3 → 取消登記\n• 重置本月 → 清除所有資料")
+              "🏸 羽球出團小幫手\n\n請將我加入羽球群組使用！\n\n群組內指令：\n• 我可以的日期 6月3/13/17 → 登記可打日期\n• 更正日期 6月3/20/27 → 清掉舊日期重新登記\n• 取消日期 6月13 → 取消特定日期\n• 查詢統計 → 查看目前統計\n• 重置本月 → 清除所有人資料（管理用）")
         return
 
     group_id = event.source.group_id
@@ -151,12 +155,12 @@ def handle_message(event):
     display_name = get_user_display_name(user_id, group_id)
     month_key = get_current_month_key()
 
-    if "以下日期我可以" in text:
-        idx = text.find("以下日期我可以")
-        date_part = text[idx + len("以下日期我可以"):]
+    if "我可以的日期" in text:
+        idx = text.find("我可以的日期")
+        date_part = text[idx + len("我可以的日期"):]
         dates = parse_dates(date_part)
         if not dates:
-            reply(event.reply_token, f"@{display_name} 沒有偵測到有效日期！\n請用格式：以下日期我可以 6月 3/13/17")
+            reply(event.reply_token, f"@{display_name} 沒有偵測到有效日期！\n請用格式：我可以的日期 6月3/13/17")
             return
         for d in dates:
             schedule_data[group_id][month_key][d][user_id] = display_name
@@ -164,7 +168,24 @@ def handle_message(event):
         msg += build_summary_message(group_id)
         reply(event.reply_token, msg)
 
-    elif text in ["查詢出團", "出團統計", "羽球統計", "統計"]:
+    elif text.startswith("更正日期"):
+        date_part = text.replace("更正日期", "").strip()
+        dates = parse_dates(date_part)
+        if not dates:
+            reply(event.reply_token, f"@{display_name} 沒有偵測到有效日期！\n請用格式：更正日期 6月3/20/27")
+            return
+        for date_str in list(schedule_data[group_id][month_key].keys()):
+            if user_id in schedule_data[group_id][month_key][date_str]:
+                del schedule_data[group_id][month_key][date_str][user_id]
+                if not schedule_data[group_id][month_key][date_str]:
+                    del schedule_data[group_id][month_key][date_str]
+        for d in dates:
+            schedule_data[group_id][month_key][d][user_id] = display_name
+        msg = f"✅ 已更正 {display_name} 的日期為 {'、'.join(dates)}！\n\n"
+        msg += build_summary_message(group_id)
+        reply(event.reply_token, msg)
+
+    elif text in ["查詢統計", "出團統計", "羽球統計", "統計"]:
         reply(event.reply_token, build_summary_message(group_id))
 
     elif text.startswith("取消日期"):
@@ -188,6 +209,7 @@ def handle_message(event):
     elif text == "重置本月":
         schedule_data[group_id][month_key].clear()
         reply(event.reply_token, "🗑️ 已清除本月所有登記資料。")
+
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 5000))
