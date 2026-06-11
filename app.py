@@ -17,7 +17,9 @@ configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 schedule_data = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
+fee_data = defaultdict(lambda: defaultdict(dict))  # fee_data[group_id][month_key][date_str] = {persons, hours, total, per_person}
 MIN_PLAYERS = 4
+COURT_FEE_PER_HOUR = 550
 
 def get_current_month_key():
     now = datetime.now()
@@ -29,7 +31,6 @@ def parse_dates(text):
     current_year = now.year
     current_month = now.month
 
-    # 格式一：「6月 3/13/17」或「6月3/13/17」- 指定月份（保留向下相容）
     cn_month_match = re.search(r'(\d{1,2})月\s*(\d{1,2}(?:[/、,]\d{1,2})*)', text)
     if cn_month_match:
         month = int(cn_month_match.group(1))
@@ -43,7 +44,6 @@ def parse_dates(text):
                 pass
         return list(dict.fromkeys(dates))
 
-    # 格式二：純數字日期「3/13/17」或「3、13、17」，自動補當月
     slash_days = re.findall(r'\d{1,2}', text)
     for d in slash_days:
         day = int(d)
@@ -55,6 +55,29 @@ def parse_dates(text):
                 pass
 
     return list(dict.fromkeys(dates))
+
+def parse_time_range(time_str):
+    """解析 2030-2230 格式，回傳小時數"""
+    match = re.match(r'(\d{4})-(\d{4})', time_str.strip())
+    if not match:
+        return None, None, None
+    start_str = match.group(1)
+    end_str = match.group(2)
+    start_h, start_m = int(start_str[:2]), int(start_str[2:])
+    end_h, end_m = int(end_str[:2]), int(end_str[2:])
+    start_total = start_h * 60 + start_m
+    end_total = end_h * 60 + end_m
+    if end_total <= start_total:
+        return None, None, None
+    hours = (end_total - start_total) / 60
+    start_fmt = f"{start_h:02d}:{start_m:02d}"
+    end_fmt = f"{end_h:02d}:{end_m:02d}"
+    return hours, start_fmt, end_fmt
+
+def parse_date_from_str(date_str):
+    """從 6/2 格式取得月份"""
+    parts = date_str.split('/')
+    return int(parts[0]), int(parts[1])
 
 def get_user_display_name(user_id, group_id=None):
     try:
@@ -107,6 +130,150 @@ def build_summary_message(group_id):
             lines.append(f"     {' / '.join(names)}")
     return "\n".join(lines)
 
+def build_fee_message(group_id, month_key, results):
+    """建立場地費用結算訊息"""
+    lines = ["💰 場地費用結算\n"]
+
+    # 各日期明細
+    for r in results:
+        lines.append(f"{r['date']}")
+        lines.append(f"時間：{r['start']} - {r['end']}（{r['hours_display']}）")
+        lines.append(f"場地費：{r['total']}元")
+        lines.append(f"出席（{len(r['names'])}人）：{' / '.join(r['names'])}")
+        lines.append(f"每人：{r['per_person']}元")
+        lines.append("")
+
+    # 當月累計
+    lines.append("───────────")
+    lines.append(f"{datetime.now().month}月累計費用")
+
+    # 統計每人總費用
+    person_total = defaultdict(int)
+    for date_str, info in fee_data[group_id][month_key].items():
+        for name in info['names']:
+            person_total[name] += info['per_person']
+
+    for name, total in sorted(person_total.items()):
+        lines.append(f"{name}：{total}元")
+
+    return "\n".join(lines)
+
+def handle_fee_command(event, group_id, text):
+    """處理場地費用指令"""
+    month_key = get_current_month_key()
+    now = datetime.now()
+    current_year = now.year
+    current_month = now.month
+
+    # 解析每一行，跳過第一行「場地費用」
+    lines = text.strip().splitlines()
+    entries = []
+    errors = []
+
+    for line in lines[1:]:
+        line = line.strip()
+        if not line:
+            continue
+
+        # 格式：6/2 2030-2230
+        match = re.match(r'(\d{1,2}/\d{1,2})\s+(\d{4}-\d{4})', line)
+        if not match:
+            errors.append(f"無法解析：{line}")
+            continue
+
+        date_str = match.group(1)
+        time_str = match.group(2)
+
+        # 驗證日期
+        month_part, day_part = date_str.split('/')
+        try:
+            datetime(current_year, int(month_part), int(day_part))
+        except ValueError:
+            errors.append(f"無效日期：{date_str}")
+            continue
+
+        # 解析時間
+        hours, start_fmt, end_fmt = parse_time_range(time_str)
+        if hours is None:
+            errors.append(f"無效時間：{time_str}")
+            continue
+
+        # 取得當天出席名單（從登記資料）
+        names = list(schedule_data[group_id][month_key].get(date_str, {}).values())
+        if not names:
+            errors.append(f"{date_str} 沒有人登記出席")
+            continue
+
+        total = int(COURT_FEE_PER_HOUR * hours)
+        per_person = int(total / len(names))
+
+        # 小時顯示
+        if hours == int(hours):
+            hours_display = f"{int(hours)}小時"
+        else:
+            h = int(hours)
+            m = int((hours - h) * 60)
+            hours_display = f"{h}小時{m}分"
+
+        entries.append({
+            'date': date_str,
+            'start': start_fmt,
+            'end': end_fmt,
+            'hours': hours,
+            'hours_display': hours_display,
+            'total': total,
+            'per_person': per_person,
+            'names': names,
+        })
+
+    if not entries and errors:
+        reply(event.reply_token, "❌ 格式錯誤，請用：\n場地費用\n6/2 2030-2230\n6/12 2030-2230")
+        return
+
+    # 儲存（覆蓋舊的）
+    for r in entries:
+        fee_data[group_id][month_key][r['date']] = {
+            'names': r['names'],
+            'per_person': r['per_person'],
+        }
+
+    msg = build_fee_message(group_id, month_key, entries)
+
+    if errors:
+        msg += "\n\n⚠️ 以下日期無法處理：\n" + "\n".join(errors)
+
+    reply(event.reply_token, msg)
+
+def handle_query_fee(event, group_id):
+    """查詢當月費用"""
+    month_key = get_current_month_key()
+    current_month = datetime.now().month
+
+    if not fee_data[group_id][month_key]:
+        reply(event.reply_token, "📊 本月還沒有場地費用記錄！")
+        return
+
+    person_total = defaultdict(int)
+    lines = [f"💰 {current_month}月場地費用明細\n"]
+
+    def sort_key(d):
+        p = d.split('/')
+        return (int(p[0]), int(p[1]))
+
+    for date_str in sorted(fee_data[group_id][month_key].keys(), key=sort_key):
+        info = fee_data[group_id][month_key][date_str]
+        lines.append(f"{date_str}（每人 {info['per_person']}元）")
+        lines.append(f"  {' / '.join(info['names'])}")
+        for name in info['names']:
+            person_total[name] += info['per_person']
+
+    lines.append("\n───────────")
+    lines.append("累計費用")
+    for name, total in sorted(person_total.items()):
+        lines.append(f"{name}：{total}元")
+
+    reply(event.reply_token, "\n".join(lines))
+
 def reply(reply_token, text):
     with ApiClient(configuration) as api_client:
         api = MessagingApi(api_client)
@@ -131,7 +298,7 @@ def callback():
 def handle_message(event):
     if event.source.type != 'group':
         reply(event.reply_token,
-              "🏸 羽球出團小幫手\n\n請將我加入羽球群組使用！\n\n群組內指令：\n• 我可以的日期 3/13/17 → 登記可打日期\n• 更正日期 3/13 → 清掉重登\n• 取消日期 13 → 取消特定日期\n• 查詢統計 → 查看統計\n• 重置本月 → 清除所有人資料")
+              "🏸 羽球出團小幫手\n\n請將我加入羽球群組使用！\n\n群組內指令：\n• 我可以的日期 3/13/17 → 登記可打日期\n• 更正日期 3/13 → 清掉重登\n• 取消日期 13 → 取消特定日期\n• 查詢統計 → 查看出團統計\n• 場地費用 → 結算場地費\n• 查詢費用 → 查看當月費用\n• 重置本月 → 清除所有資料")
         return
 
     group_id = event.source.group_id
@@ -160,13 +327,11 @@ def handle_message(event):
         if not dates:
             reply(event.reply_token, f"@{display_name} 沒有偵測到有效日期！\n請用格式：更正日期 3/13/17")
             return
-        # 清掉此人當月所有日期
         for date_str in list(schedule_data[group_id][month_key].keys()):
             if user_id in schedule_data[group_id][month_key][date_str]:
                 del schedule_data[group_id][month_key][date_str][user_id]
                 if not schedule_data[group_id][month_key][date_str]:
                     del schedule_data[group_id][month_key][date_str]
-        # 重新登記
         for d in dates:
             schedule_data[group_id][month_key][d][user_id] = display_name
         msg = f"✅ 已更正 {display_name} 的日期為 {'、'.join(dates)}！\n\n"
@@ -195,9 +360,16 @@ def handle_message(event):
     elif text in ["查詢統計", "出團統計", "羽球統計", "統計"]:
         reply(event.reply_token, build_summary_message(group_id))
 
+    elif text.startswith("場地費用"):
+        handle_fee_command(event, group_id, text)
+
+    elif text in ["查詢費用", "費用統計", "費用"]:
+        handle_query_fee(event, group_id)
+
     elif text == "重置本月":
         schedule_data[group_id][month_key].clear()
-        reply(event.reply_token, "🗑️ 已清除本月所有登記資料。")
+        fee_data[group_id][month_key].clear()
+        reply(event.reply_token, "🗑️ 已清除本月所有登記及費用資料。")
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 5000))
