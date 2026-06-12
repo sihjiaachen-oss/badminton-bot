@@ -379,6 +379,10 @@ def remind():
         return jsonify({"status": "no players today"}), 200
 
     names = list(players.values())
+
+    if len(names) < MIN_PLAYERS:
+        return jsonify({"status": "not enough players", "count": len(names)}), 200
+
     mention_str = " ".join([f"@{name}" for name in names])
     msg = f"🏸 今天 {today} 要打球囉！\n出席：{' / '.join(names)}\n\n{mention_str}"
 
