@@ -32,8 +32,6 @@ DISCOUNT_SLOTS = [
     (2000, 2200),
 ]
 
-# ── Redis 存取工具 ──────────────────────────────
-
 def redis_key_schedule(group_id, month_key):
     return f"schedule:{group_id}:{month_key}"
 
@@ -53,8 +51,6 @@ def get_fee(group_id, month_key):
 
 def save_fee(group_id, month_key, data):
     r.set(redis_key_fee(group_id, month_key), json.dumps(data, ensure_ascii=False))
-
-# ── 工具函式 ────────────────────────────────────
 
 def get_current_month_key():
     now = datetime.now()
@@ -106,6 +102,35 @@ def parse_dates(text):
                 pass
 
     return list(dict.fromkeys(dates))
+
+def parse_proxy_command(text, keyword):
+    """
+    解析代登記/代更正/代取消指令
+    支援格式：
+    代登記 小王 3/13/17
+    代登記小王 3/13/17
+    代登記 小王3/13/17
+    代登記小王3/13/17
+    邏輯：去掉關鍵字後，找到第一個數字出現的位置，前面是名字，後面是日期
+    """
+    rest = text[len(keyword):].strip()
+    if not rest:
+        return None, None
+
+    # 找到第一個數字的位置，之前是名字，之後是日期
+    match = re.search(r'\d', rest)
+    if not match:
+        return None, None
+
+    first_digit_pos = match.start()
+    proxy_name = rest[:first_digit_pos].strip()
+    date_part = rest[first_digit_pos:]
+
+    if not proxy_name:
+        return None, None
+
+    dates = parse_dates(date_part)
+    return proxy_name, dates
 
 def parse_time_range(time_str):
     match = re.match(r'(\d{4})-(\d{4})', time_str.strip())
@@ -374,7 +399,7 @@ def callback():
 def handle_message(event):
     if event.source.type != 'group':
         reply(event.reply_token,
-              "🏸 羽球出團小幫手\n\n請將我加入羽球群組使用！\n\n群組內指令：\n• 我可以的日期 3/13/17 → 登記可打日期\n• 更正日期 3/13 → 清掉重登\n• 取消日期 13 → 取消特定日期\n• 查詢統計 → 查看出團統計\n• 場地費用 → 結算場地費\n• 查詢費用 → 查看當月費用\n• 重置本月 → 清除所有資料")
+              "🏸 羽球出團小幫手\n\n請將我加入羽球群組使用！\n\n群組內指令：\n• 我可以的日期 3/13/17 → 登記可打日期\n• 更正日期 3/13 → 清掉重登\n• 取消日期 13 → 取消特定日期\n• 代登記 小王 3/13/17 → 幫人登記\n• 代更正 小王 3/20 → 幫人更正\n• 代取消 小王 13 → 幫人取消\n• 查詢統計 → 查看出團統計\n• 場地費用 → 結算場地費\n• 查詢費用 → 查看當月費用\n• 重置本月 → 清除所有資料")
         return
 
     group_id = event.source.group_id
@@ -444,6 +469,65 @@ def handle_message(event):
             msg += build_summary_message(group_id)
         else:
             msg = f"找不到 {display_name} 在指定日期的登記。"
+        reply(event.reply_token, msg)
+
+    elif "代登記" in text:
+        proxy_name, dates = parse_proxy_command(text, "代登記")
+        if not proxy_name or not dates:
+            reply(event.reply_token, "格式錯誤！請用：代登記 小王 3/13/17")
+            return
+        proxy_id = f"proxy_{proxy_name}"
+        schedule = get_schedule(group_id, month_key)
+        for d in dates:
+            if d not in schedule:
+                schedule[d] = {}
+            schedule[d][proxy_id] = proxy_name
+        save_schedule(group_id, month_key, schedule)
+        msg = f"✅ 已代登記 {proxy_name} 在 {'、'.join(dates)} 可以打球！\n\n"
+        msg += build_summary_message(group_id)
+        reply(event.reply_token, msg)
+
+    elif "代更正" in text:
+        proxy_name, dates = parse_proxy_command(text, "代更正")
+        if not proxy_name or not dates:
+            reply(event.reply_token, "格式錯誤！請用：代更正 小王 3/13/17")
+            return
+        proxy_id = f"proxy_{proxy_name}"
+        schedule = get_schedule(group_id, month_key)
+        for date_str in list(schedule.keys()):
+            if proxy_id in schedule[date_str]:
+                del schedule[date_str][proxy_id]
+                if not schedule[date_str]:
+                    del schedule[date_str]
+        for d in dates:
+            if d not in schedule:
+                schedule[d] = {}
+            schedule[d][proxy_id] = proxy_name
+        save_schedule(group_id, month_key, schedule)
+        msg = f"✅ 已更正 {proxy_name} 的日期為 {'、'.join(dates)}！\n\n"
+        msg += build_summary_message(group_id)
+        reply(event.reply_token, msg)
+
+    elif "代取消" in text:
+        proxy_name, dates = parse_proxy_command(text, "代取消")
+        if not proxy_name or not dates:
+            reply(event.reply_token, "格式錯誤！請用：代取消 小王 13")
+            return
+        proxy_id = f"proxy_{proxy_name}"
+        schedule = get_schedule(group_id, month_key)
+        removed = []
+        for d in dates:
+            if d in schedule and proxy_id in schedule[d]:
+                del schedule[d][proxy_id]
+                removed.append(d)
+                if not schedule[d]:
+                    del schedule[d]
+        if removed:
+            save_schedule(group_id, month_key, schedule)
+            msg = f"✅ 已取消 {proxy_name} 在 {'、'.join(removed)} 的登記。\n\n"
+            msg += build_summary_message(group_id)
+        else:
+            msg = f"找不到 {proxy_name} 在指定日期的登記。"
         reply(event.reply_token, msg)
 
     elif text in ["查詢統計", "出團統計", "羽球統計", "統計"]:
