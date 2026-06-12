@@ -2,13 +2,19 @@ name: Daily Badminton Reminder
 
 on:
   schedule:
-    - cron: '0 3 * * *'  # 台灣時間早上 11 點（UTC+8，所以 UTC 是 03:00）
-  workflow_dispatch:  # 允許手動觸發測試
+    - cron: '0 3 * * *'
+  workflow_dispatch:
 
 jobs:
   remind:
     runs-on: ubuntu-latest
     steps:
+      - name: Wake up server
+        run: curl https://badminton-bot-fod0.onrender.com/callback || true
+
+      - name: Wait for server to wake up
+        run: sleep 35
+
       - name: Send reminder to LINE group
         run: |
           curl -X POST https://badminton-bot-fod0.onrender.com/remind \
