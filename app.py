@@ -248,7 +248,7 @@ def remind():
 def handle_message(event):
     if event.source.type != 'group':
         reply(event.reply_token,
-              "🏸 羽球出團小幫手\n\n群組內指令：\n• 我可以的日期 3/13/17 → 登記日期（自動補當月）\n• 我可以的日期 7月5/12 → 登記跨月日期\n• 更正日期 3/13 → 清掉重登（當月）\n• 取消日期 13 → 取消特定日期（當月）\n• 代登記 小王 3/13/17 → 幫人登記\n• 查詢統計 → 查看當月統計\n• 查詢統計 7月 → 查看指定月份統計\n• 場地費用\n  6/2 2030-2230 → 結算費用\n• 查詢費用 → 查看當月費用\n• 重置本月 → 清除所有資料")
+              "🏸 羽球出團小幫手\n\n群組內指令：\n• 我可以的日期 3/13/17 → 登記日期（自動補當月）\n• 我可以的日期 7月5/12 → 登記跨月日期\n• 更正日期 3/13 → 清掉重登（當月）\n• 取消日期 13 → 取消特定日期（當月）\n• 代登記 小王 3/13/17 → 幫人登記\n• 查詢統計 → 查看當月統計\n• 查詢統計 7月 → 查看指定月份統計\n• 場地費用\n  6/2 2030-2230 → 結算費用\n• 查詢費用 → 查看當月費用\n• 重置本月 → 清除當月所有資料\n• 重置 7月 → 清除指定月份資料")
         return
 
     group_id = event.source.group_id
@@ -522,6 +522,15 @@ def handle_message(event):
         r.delete(f"schedule:{group_id}:{current_month_key}")
         r.delete(f"fees:{group_id}:{current_month_key}")
         reply(event.reply_token, "🗑️ 已清除本月所有登記及費用資料。")
+
+    # 重置指定月份
+    elif re.match(r'^重置\s*\d{1,2}月$', text):
+        month_match = re.search(r'(\d{1,2})月', text)
+        target_month = int(month_match.group(1))
+        target_mk = month_key_for(target_month)
+        r.delete(f"schedule:{group_id}:{target_mk}")
+        r.delete(f"fees:{group_id}:{target_mk}")
+        reply(event.reply_token, f"🗑️ 已清除 {target_month}月所有登記及費用資料。")
 
 
 if __name__ == "__main__":
