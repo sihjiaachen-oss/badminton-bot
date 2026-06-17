@@ -2,152 +2,113 @@ import os
 import re
 import json
 from datetime import datetime
-from collections import defaultdict
-from flask import Flask, request, abort, jsonify
+from flask import Flask, request, abort
 import redis
 from linebot.v3 import WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
-from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, ReplyMessageRequest, PushMessageRequest, TextMessage
+from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, ReplyMessageRequest, TextMessage
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
 app = Flask(__name__)
 
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '')
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '')
-GROUP_ID = os.environ.get('LINE_GROUP_ID', '')
-REDIS_URL = os.environ.get('REDIS_URL', '')
+LINE_GROUP_ID = os.environ.get('LINE_GROUP_ID', '')
+REMIND_SECRET = os.environ.get('REMIND_SECRET', '')
+REDIS_URL = os.environ.get('REDIS_URL', 'redis://localhost:6379')
 
 configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
-
 r = redis.from_url(REDIS_URL, decode_responses=True)
 
 MIN_PLAYERS = 4
 COURT_FEE_NORMAL = 550
 COURT_FEE_DISCOUNT = 500
+DISCOUNT_SLOTS = [('1200', '1400'), ('1800', '2000'), ('2000', '2200')]
 
-DISCOUNT_SLOTS = [
-    (1200, 1400),
-    (1800, 2000),
-    (2000, 2200),
-]
 
-def redis_key_schedule(group_id, month_key):
-    return f"schedule:{group_id}:{month_key}"
-
-def redis_key_fee(group_id, month_key):
-    return f"fee:{group_id}:{month_key}"
+# ── Redis helpers ──────────────────────────────────────────
 
 def get_schedule(group_id, month_key):
-    raw = r.get(redis_key_schedule(group_id, month_key))
-    return json.loads(raw) if raw else {}
+    key = f"schedule:{group_id}:{month_key}"
+    val = r.get(key)
+    return json.loads(val) if val else {}
 
 def save_schedule(group_id, month_key, data):
-    r.set(redis_key_schedule(group_id, month_key), json.dumps(data, ensure_ascii=False))
+    key = f"schedule:{group_id}:{month_key}"
+    r.set(key, json.dumps(data, ensure_ascii=False))
 
-def get_fee(group_id, month_key):
-    raw = r.get(redis_key_fee(group_id, month_key))
-    return json.loads(raw) if raw else {}
+def get_fees(group_id, month_key):
+    key = f"fees:{group_id}:{month_key}"
+    val = r.get(key)
+    return json.loads(val) if val else {}
 
-def save_fee(group_id, month_key, data):
-    r.set(redis_key_fee(group_id, month_key), json.dumps(data, ensure_ascii=False))
+def save_fees(group_id, month_key, data):
+    key = f"fees:{group_id}:{month_key}"
+    r.set(key, json.dumps(data, ensure_ascii=False))
+
+
+# ── Helpers ────────────────────────────────────────────────
 
 def get_current_month_key():
     now = datetime.now()
     return f"{now.year}-{now.month:02d}"
 
-def is_discount_slot(date_str, start_fmt, end_fmt):
+def month_key_for(month):
+    """根據月份數字算出該存到哪一年（處理跨年，例如12月登記隔年1月）"""
     now = datetime.now()
-    month, day = date_str.split('/')
-    try:
-        dt = datetime(now.year, int(month), int(day))
-    except ValueError:
-        return False
-    if dt.weekday() not in (5, 6):
-        return False
-    start_int = int(start_fmt.replace(':', ''))
-    end_int = int(end_fmt.replace(':', ''))
-    for slot_start, slot_end in DISCOUNT_SLOTS:
-        if start_int == slot_start and end_int == slot_end:
-            return True
-    return False
+    current_year = now.year
+    current_month = now.month
+    year = current_year
+    if month < current_month:
+        # 月份比現在小，視為明年（例如現在12月，登記1月）
+        year = current_year + 1
+    return f"{year}-{month:02d}"
 
-def parse_dates(text):
-    dates = []
+def parse_dates_with_month(text):
+    """
+    解析日期，回傳 [(month_key, date_str), ...]
+    支援跨月份登記：每個日期會根據自己的月份分別歸類
+    """
+    results = []
     now = datetime.now()
     current_year = now.year
     current_month = now.month
 
+    # 格式一：「7月 5/12/19」- 指定月份後列日期
     cn_month_match = re.search(r'(\d{1,2})月\s*(\d{1,2}(?:[/、,]\d{1,2})*)', text)
     if cn_month_match:
         month = int(cn_month_match.group(1))
         day_part = cn_month_match.group(2)
         days = re.findall(r'\d{1,2}', day_part)
+        mk = month_key_for(month)
+        year = int(mk.split('-')[0])
         for d in days:
             try:
-                datetime(current_year, month, int(d))
-                dates.append(f"{month}/{int(d)}")
+                datetime(year, month, int(d))
+                results.append((mk, f"{month}/{int(d)}"))
             except ValueError:
                 pass
-        return list(dict.fromkeys(dates))
+        return results
 
+    # 格式二：純日期，自動補當月
     slash_days = re.findall(r'\d{1,2}', text)
+    mk = get_current_month_key()
     for d in slash_days:
         day = int(d)
         if 1 <= day <= 31:
             try:
                 datetime(current_year, current_month, day)
-                dates.append(f"{current_month}/{day}")
+                results.append((mk, f"{current_month}/{day}"))
             except ValueError:
                 pass
 
-    return list(dict.fromkeys(dates))
+    return results
 
-def parse_proxy_command(text, keyword):
-    """
-    解析代登記/代更正/代取消指令
-    支援格式：
-    代登記 小王 3/13/17
-    代登記小王 3/13/17
-    代登記 小王3/13/17
-    代登記小王3/13/17
-    邏輯：去掉關鍵字後，找到第一個數字出現的位置，前面是名字，後面是日期
-    """
-    rest = text[len(keyword):].strip()
-    if not rest:
-        return None, None
-
-    # 找到第一個數字的位置，之前是名字，之後是日期
-    match = re.search(r'\d', rest)
-    if not match:
-        return None, None
-
-    first_digit_pos = match.start()
-    proxy_name = rest[:first_digit_pos].strip()
-    date_part = rest[first_digit_pos:]
-
-    if not proxy_name:
-        return None, None
-
-    dates = parse_dates(date_part)
-    return proxy_name, dates
-
-def parse_time_range(time_str):
-    match = re.match(r'(\d{4})-(\d{4})', time_str.strip())
-    if not match:
-        return None, None, None
-    start_str = match.group(1)
-    end_str = match.group(2)
-    start_h, start_m = int(start_str[:2]), int(start_str[2:])
-    end_h, end_m = int(end_str[:2]), int(end_str[2:])
-    start_total = start_h * 60 + start_m
-    end_total = end_h * 60 + end_m
-    if end_total <= start_total:
-        return None, None, None
-    hours = (end_total - start_total) / 60
-    start_fmt = f"{start_h:02d}:{start_m:02d}"
-    end_fmt = f"{end_h:02d}:{end_m:02d}"
-    return hours, start_fmt, end_fmt
+def parse_dates(text):
+    """舊版相容：只回傳日期字串列表（用於取消/更正，這些操作通常針對當月）"""
+    pairs = parse_dates_with_month(text)
+    return [d for _, d in pairs]
 
 def get_user_display_name(user_id, group_id=None):
     try:
@@ -161,13 +122,14 @@ def get_user_display_name(user_id, group_id=None):
     except Exception:
         return f"用戶_{user_id[-4:]}"
 
-def build_summary_message(group_id):
-    month_key = get_current_month_key()
+def build_summary_message(group_id, month_key=None):
+    if month_key is None:
+        month_key = get_current_month_key()
     data = get_schedule(group_id, month_key)
-    if not data:
-        return "📊 目前還沒有人登記日期喔！"
+    display_month = int(month_key.split('-')[1])
 
-    current_month = datetime.now().month
+    if not data:
+        return f"📊 {display_month}月目前還沒有人登記日期喔！"
 
     def sort_key(d):
         p = d.split('/')
@@ -185,7 +147,7 @@ def build_summary_message(group_id):
         else:
             short_team.append((date_str, count, names))
 
-    lines = [f"🏸 {current_month}月 羽球出團統計\n"]
+    lines = [f"🏸 {display_month}月 羽球出團統計\n"]
     if full_team:
         lines.append("✅ 可以開團的日期：")
         for date_str, count, names in full_team:
@@ -200,143 +162,24 @@ def build_summary_message(group_id):
             lines.append(f"     {' / '.join(names)}")
     return "\n".join(lines)
 
-def build_fee_message(group_id, month_key, results):
-    lines = ["💰 場地費用結算\n"]
-    for r_entry in results:
-        discount_tag = "（優惠時段）" if r_entry['is_discount'] else ""
-        lines.append(f"{r_entry['date']}{discount_tag}")
-        lines.append(f"時間：{r_entry['start']} - {r_entry['end']}（{r_entry['hours_display']}）")
-        lines.append(f"場地費：{r_entry['total']}元（{r_entry['rate']}元/小時）")
-        lines.append(f"出席（{len(r_entry['names'])}人）：{' / '.join(r_entry['names'])}")
-        lines.append(f"每人：{r_entry['per_person']}元")
-        lines.append("")
+def is_discount_slot(date_str, start_str, end_str, month_key):
+    try:
+        parts = date_str.split('/')
+        month, day = int(parts[0]), int(parts[1])
+        year = int(month_key.split('-')[0])
+        dt = datetime(year, month, day)
+        weekday = dt.weekday()
+        if weekday not in (5, 6):
+            return False
+        return (start_str, end_str) in DISCOUNT_SLOTS
+    except Exception:
+        return False
 
-    lines.append("───────────")
-    lines.append(f"{datetime.now().month}月累計費用")
-
-    fee_data = get_fee(group_id, month_key)
-    person_total = defaultdict(int)
-    for date_str, info in fee_data.items():
-        for name in info['names']:
-            person_total[name] += info['per_person']
-
-    for name, total in sorted(person_total.items()):
-        lines.append(f"{name}：{total}元")
-
-    return "\n".join(lines)
-
-def handle_fee_command(event, group_id, text):
-    month_key = get_current_month_key()
-    now = datetime.now()
-    current_year = now.year
-
-    lines = text.strip().splitlines()
-    entries = []
-    errors = []
-    schedule = get_schedule(group_id, month_key)
-
-    for line in lines[1:]:
-        line = line.strip()
-        if not line:
-            continue
-
-        match = re.match(r'(\d{1,2}/\d{1,2})\s+(\d{4}-\d{4})', line)
-        if not match:
-            errors.append(f"無法解析：{line}")
-            continue
-
-        date_str = match.group(1)
-        time_str = match.group(2)
-
-        month_part, day_part = date_str.split('/')
-        try:
-            datetime(current_year, int(month_part), int(day_part))
-        except ValueError:
-            errors.append(f"無效日期：{date_str}")
-            continue
-
-        hours, start_fmt, end_fmt = parse_time_range(time_str)
-        if hours is None:
-            errors.append(f"無效時間：{time_str}")
-            continue
-
-        names = list(schedule.get(date_str, {}).values())
-        if not names:
-            errors.append(f"{date_str} 沒有人登記出席")
-            continue
-
-        discount = is_discount_slot(date_str, start_fmt, end_fmt)
-        rate = COURT_FEE_DISCOUNT if discount else COURT_FEE_NORMAL
-        total = int(rate * hours)
-        per_person = int(total / len(names))
-
-        if hours == int(hours):
-            hours_display = f"{int(hours)}小時"
-        else:
-            h = int(hours)
-            m = int((hours - h) * 60)
-            hours_display = f"{h}小時{m}分"
-
-        entries.append({
-            'date': date_str,
-            'start': start_fmt,
-            'end': end_fmt,
-            'hours': hours,
-            'hours_display': hours_display,
-            'total': total,
-            'per_person': per_person,
-            'names': names,
-            'is_discount': discount,
-            'rate': rate,
-        })
-
-    if not entries and errors:
-        reply(event.reply_token, "❌ 格式錯誤，請用：\n場地費用\n6/2 2030-2230\n6/12 2030-2230")
-        return
-
-    fee_data = get_fee(group_id, month_key)
-    for entry in entries:
-        fee_data[entry['date']] = {
-            'names': entry['names'],
-            'per_person': entry['per_person'],
-        }
-    save_fee(group_id, month_key, fee_data)
-
-    msg = build_fee_message(group_id, month_key, entries)
-    if errors:
-        msg += "\n\n⚠️ 以下日期無法處理：\n" + "\n".join(errors)
-
-    reply(event.reply_token, msg)
-
-def handle_query_fee(event, group_id):
-    month_key = get_current_month_key()
-    current_month = datetime.now().month
-    fee_data = get_fee(group_id, month_key)
-
-    if not fee_data:
-        reply(event.reply_token, "📊 本月還沒有場地費用記錄！")
-        return
-
-    person_total = defaultdict(int)
-    lines = [f"💰 {current_month}月場地費用明細\n"]
-
-    def sort_key(d):
-        p = d.split('/')
-        return (int(p[0]), int(p[1]))
-
-    for date_str in sorted(fee_data.keys(), key=sort_key):
-        info = fee_data[date_str]
-        lines.append(f"{date_str}（每人 {info['per_person']}元）")
-        lines.append(f"  {' / '.join(info['names'])}")
-        for name in info['names']:
-            person_total[name] += info['per_person']
-
-    lines.append("\n───────────")
-    lines.append("累計費用")
-    for name, total in sorted(person_total.items()):
-        lines.append(f"{name}：{total}元")
-
-    reply(event.reply_token, "\n".join(lines))
+def calc_hours(start_str, end_str):
+    sh, sm = int(start_str[:2]), int(start_str[2:])
+    eh, em = int(end_str[:2]), int(end_str[2:])
+    total_min = (eh * 60 + em) - (sh * 60 + sm)
+    return total_min / 60
 
 def reply(reply_token, text):
     with ApiClient(configuration) as api_client:
@@ -350,6 +193,7 @@ def reply(reply_token, text):
 
 def push_message(group_id, text):
     with ApiClient(configuration) as api_client:
+        from linebot.v3.messaging import PushMessageRequest
         api = MessagingApi(api_client)
         api.push_message_with_http_info(
             PushMessageRequest(
@@ -358,36 +202,8 @@ def push_message(group_id, text):
             )
         )
 
-@app.route("/remind", methods=['POST'])
-def remind():
-    secret = request.headers.get('X-Remind-Secret', '')
-    if secret != os.environ.get('REMIND_SECRET', ''):
-        abort(403)
 
-    now = datetime.now()
-    today = f"{now.month}/{now.day}"
-    month_key = get_current_month_key()
-    group_id = GROUP_ID
-
-    if not group_id:
-        return jsonify({"status": "no group_id set"}), 400
-
-    schedule = get_schedule(group_id, month_key)
-    players = schedule.get(today, {})
-
-    if not players:
-        return jsonify({"status": "no players today"}), 200
-
-    names = list(players.values())
-
-    if len(names) < MIN_PLAYERS:
-        return jsonify({"status": "not enough players", "count": len(names)}), 200
-
-    mention_str = " ".join([f"@{name}" for name in names])
-    msg = f"🏸 今天 {today} 要打球囉！\n出席：{' / '.join(names)}\n\n{mention_str}"
-
-    push_message(group_id, msg)
-    return jsonify({"status": "sent", "date": today, "players": names}), 200
+# ── Routes ─────────────────────────────────────────────────
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -399,154 +215,314 @@ def callback():
         abort(400)
     return 'OK'
 
+@app.route("/remind", methods=['POST'])
+def remind():
+    secret = request.headers.get('X-Remind-Secret', '')
+    if secret != REMIND_SECRET:
+        abort(403)
+
+    today = datetime.now()
+    today_str = f"{today.month}/{today.day}"
+    month_key = get_current_month_key()  # 提醒永遠抓「今天」所屬的月份
+    group_id = LINE_GROUP_ID
+
+    if not group_id:
+        return 'no group id', 200
+
+    data = get_schedule(group_id, month_key)
+    if today_str not in data:
+        return 'no event today', 200
+
+    players = data[today_str]
+    names = list(players.values())
+    mentions = [f"@{name}" for name in names]
+
+    msg = f"🏸 今天 {today_str} 要打球囉！\n出席：{' / '.join(names)}\n{' '.join(mentions)}"
+    push_message(group_id, msg)
+    return 'ok', 200
+
+
+# ── Message handler ────────────────────────────────────────
+
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     if event.source.type != 'group':
         reply(event.reply_token,
-              "🏸 羽球出團小幫手\n\n請將我加入羽球群組使用！\n\n群組內指令：\n• 我可以的日期 3/13/17 → 登記可打日期\n• 更正日期 3/13 → 清掉重登\n• 取消日期 13 → 取消特定日期\n• 代登記 小王 3/13/17 → 幫人登記\n• 代更正 小王 3/20 → 幫人更正\n• 代取消 小王 13 → 幫人取消\n• 查詢統計 → 查看出團統計\n• 場地費用 → 結算場地費\n• 查詢費用 → 查看當月費用\n• 重置本月 → 清除所有資料")
+              "🏸 羽球出團小幫手\n\n群組內指令：\n• 我可以的日期 3/13/17 → 登記日期（自動補當月）\n• 我可以的日期 7月5/12 → 登記跨月日期\n• 更正日期 3/13 → 清掉重登（當月）\n• 取消日期 13 → 取消特定日期（當月）\n• 代登記 小王 3/13/17 → 幫人登記\n• 查詢統計 → 查看當月統計\n• 查詢統計 7月 → 查看指定月份統計\n• 場地費用\n  6/2 2030-2230 → 結算費用\n• 查詢費用 → 查看當月費用\n• 重置本月 → 清除所有資料")
         return
 
     group_id = event.source.group_id
     user_id = event.source.user_id
     text = event.message.text.strip()
     display_name = get_user_display_name(user_id, group_id)
-    month_key = get_current_month_key()
+    current_month_key = get_current_month_key()
 
-    if text == "群組ID":
-        reply(event.reply_token, f"此群組的 ID 是：\n{group_id}")
-        return
-
+    # 我可以的日期（支援跨月登記）
     if "我可以的日期" in text:
         idx = text.find("我可以的日期")
         date_part = text[idx + len("我可以的日期"):]
-        dates = parse_dates(date_part)
-        if not dates:
-            reply(event.reply_token, f"@{display_name} 沒有偵測到有效日期！\n請用格式：我可以的日期 3/13/17")
+        date_pairs = parse_dates_with_month(date_part)
+        if not date_pairs:
+            reply(event.reply_token, f"@{display_name} 沒有偵測到有效日期！\n請用格式：我可以的日期 3/13/17 或 我可以的日期 7月5/12")
             return
-        schedule = get_schedule(group_id, month_key)
-        for d in dates:
-            if d not in schedule:
-                schedule[d] = {}
-            schedule[d][user_id] = display_name
-        save_schedule(group_id, month_key, schedule)
-        msg = f"✅ 已記錄 {display_name} 在 {'、'.join(dates)} 可以打球！\n\n"
-        msg += build_summary_message(group_id)
-        reply(event.reply_token, msg)
 
-    elif "更正日期" in text:
-        idx = text.find("更正日期")
-        date_part = text[idx + len("更正日期"):]
+        # 依月份分組儲存
+        affected_month_keys = set()
+        for mk, d in date_pairs:
+            data = get_schedule(group_id, mk)
+            if d not in data:
+                data[d] = {}
+            data[d][user_id] = display_name
+            save_schedule(group_id, mk, data)
+            affected_month_keys.add(mk)
+
+        dates_display = '、'.join([d for _, d in date_pairs])
+        msg = f"✅ 已記錄 {display_name} 在 {dates_display} 可以打球！\n\n"
+        # 顯示所有受影響月份的統計
+        for mk in sorted(affected_month_keys):
+            msg += build_summary_message(group_id, mk) + "\n\n"
+        reply(event.reply_token, msg.strip())
+
+    # 更正日期（僅當月）
+    elif text.startswith("更正日期"):
+        date_part = text.replace("更正日期", "").strip()
         dates = parse_dates(date_part)
         if not dates:
-            reply(event.reply_token, f"@{display_name} 沒有偵測到有效日期！\n請用格式：更正日期 3/13/17")
+            reply(event.reply_token, "沒有偵測到有效日期！\n請用格式：更正日期 3/13/17")
             return
-        schedule = get_schedule(group_id, month_key)
-        for date_str in list(schedule.keys()):
-            if user_id in schedule[date_str]:
-                del schedule[date_str][user_id]
-                if not schedule[date_str]:
-                    del schedule[date_str]
+        data = get_schedule(group_id, current_month_key)
+        for date_str in list(data.keys()):
+            if user_id in data[date_str]:
+                del data[date_str][user_id]
+                if not data[date_str]:
+                    del data[date_str]
         for d in dates:
-            if d not in schedule:
-                schedule[d] = {}
-            schedule[d][user_id] = display_name
-        save_schedule(group_id, month_key, schedule)
+            if d not in data:
+                data[d] = {}
+            data[d][user_id] = display_name
+        save_schedule(group_id, current_month_key, data)
         msg = f"✅ 已更正 {display_name} 的日期為 {'、'.join(dates)}！\n\n"
-        msg += build_summary_message(group_id)
+        msg += build_summary_message(group_id, current_month_key)
         reply(event.reply_token, msg)
 
-    elif "取消日期" in text:
-        idx = text.find("取消日期")
-        date_part = text[idx + len("取消日期"):]
+    # 取消日期（僅當月）
+    elif text.startswith("取消日期"):
+        date_part = text.replace("取消日期", "").strip()
         dates = parse_dates(date_part)
-        schedule = get_schedule(group_id, month_key)
+        data = get_schedule(group_id, current_month_key)
         removed = []
         for d in dates:
-            if d in schedule and user_id in schedule[d]:
-                del schedule[d][user_id]
+            if d in data and user_id in data[d]:
+                del data[d][user_id]
                 removed.append(d)
-                if not schedule[d]:
-                    del schedule[d]
+                if not data[d]:
+                    del data[d]
+        save_schedule(group_id, current_month_key, data)
         if removed:
-            save_schedule(group_id, month_key, schedule)
             msg = f"✅ 已取消 {display_name} 在 {'、'.join(removed)} 的登記。\n\n"
-            msg += build_summary_message(group_id)
+            msg += build_summary_message(group_id, current_month_key)
         else:
             msg = f"找不到 {display_name} 在指定日期的登記。"
         reply(event.reply_token, msg)
 
-    elif "代登記" in text:
-        proxy_name, dates = parse_proxy_command(text, "代登記")
-        if not proxy_name or not dates:
-            reply(event.reply_token, "格式錯誤！請用：代登記 小王 3/13/17")
+    # 代登記（支援跨月）
+    elif text.startswith("代登記"):
+        rest = text.replace("代登記", "").strip()
+        match = re.match(r'(\S+)\s+(.+)', rest)
+        if not match:
+            reply(event.reply_token, "請用格式：代登記 名字 3/13/17")
             return
-        proxy_id = f"proxy_{proxy_name}"
-        schedule = get_schedule(group_id, month_key)
-        for d in dates:
-            if d not in schedule:
-                schedule[d] = {}
-            schedule[d][proxy_id] = proxy_name
-        save_schedule(group_id, month_key, schedule)
-        msg = f"✅ 已代登記 {proxy_name} 在 {'、'.join(dates)} 可以打球！\n\n"
-        msg += build_summary_message(group_id)
-        reply(event.reply_token, msg)
+        proxy_name = match.group(1)
+        date_part = match.group(2)
+        date_pairs = parse_dates_with_month(date_part)
+        if not date_pairs:
+            reply(event.reply_token, f"沒有偵測到有效日期！\n請用格式：代登記 {proxy_name} 3/13/17")
+            return
+        proxy_key = f"proxy_{proxy_name}"
+        affected_month_keys = set()
+        for mk, d in date_pairs:
+            data = get_schedule(group_id, mk)
+            if d not in data:
+                data[d] = {}
+            data[d][proxy_key] = proxy_name
+            save_schedule(group_id, mk, data)
+            affected_month_keys.add(mk)
+        dates_display = '、'.join([d for _, d in date_pairs])
+        msg = f"✅ 已代登記 {proxy_name} 在 {dates_display} 可以打球！\n\n"
+        for mk in sorted(affected_month_keys):
+            msg += build_summary_message(group_id, mk) + "\n\n"
+        reply(event.reply_token, msg.strip())
 
-    elif "代更正" in text:
-        proxy_name, dates = parse_proxy_command(text, "代更正")
-        if not proxy_name or not dates:
-            reply(event.reply_token, "格式錯誤！請用：代更正 小王 3/13/17")
+    # 代更正（僅當月）
+    elif text.startswith("代更正"):
+        rest = text.replace("代更正", "").strip()
+        match = re.match(r'(\S+)\s+(.+)', rest)
+        if not match:
+            reply(event.reply_token, "請用格式：代更正 名字 3/13/17")
             return
-        proxy_id = f"proxy_{proxy_name}"
-        schedule = get_schedule(group_id, month_key)
-        for date_str in list(schedule.keys()):
-            if proxy_id in schedule[date_str]:
-                del schedule[date_str][proxy_id]
-                if not schedule[date_str]:
-                    del schedule[date_str]
+        proxy_name = match.group(1)
+        date_part = match.group(2)
+        dates = parse_dates(date_part)
+        if not dates:
+            reply(event.reply_token, f"沒有偵測到有效日期！\n請用格式：代更正 {proxy_name} 3/13/17")
+            return
+        proxy_key = f"proxy_{proxy_name}"
+        data = get_schedule(group_id, current_month_key)
+        for date_str in list(data.keys()):
+            if proxy_key in data[date_str]:
+                del data[date_str][proxy_key]
+                if not data[date_str]:
+                    del data[date_str]
         for d in dates:
-            if d not in schedule:
-                schedule[d] = {}
-            schedule[d][proxy_id] = proxy_name
-        save_schedule(group_id, month_key, schedule)
+            if d not in data:
+                data[d] = {}
+            data[d][proxy_key] = proxy_name
+        save_schedule(group_id, current_month_key, data)
         msg = f"✅ 已更正 {proxy_name} 的日期為 {'、'.join(dates)}！\n\n"
-        msg += build_summary_message(group_id)
+        msg += build_summary_message(group_id, current_month_key)
         reply(event.reply_token, msg)
 
-    elif "代取消" in text:
-        proxy_name, dates = parse_proxy_command(text, "代取消")
-        if not proxy_name or not dates:
-            reply(event.reply_token, "格式錯誤！請用：代取消 小王 13")
+    # 代取消（僅當月）
+    elif text.startswith("代取消"):
+        rest = text.replace("代取消", "").strip()
+        match = re.match(r'(\S+)\s+(.+)', rest)
+        if not match:
+            reply(event.reply_token, "請用格式：代取消 名字 13")
             return
-        proxy_id = f"proxy_{proxy_name}"
-        schedule = get_schedule(group_id, month_key)
+        proxy_name = match.group(1)
+        date_part = match.group(2)
+        dates = parse_dates(date_part)
+        proxy_key = f"proxy_{proxy_name}"
+        data = get_schedule(group_id, current_month_key)
         removed = []
         for d in dates:
-            if d in schedule and proxy_id in schedule[d]:
-                del schedule[d][proxy_id]
+            if d in data and proxy_key in data[d]:
+                del data[d][proxy_key]
                 removed.append(d)
-                if not schedule[d]:
-                    del schedule[d]
+                if not data[d]:
+                    del data[d]
+        save_schedule(group_id, current_month_key, data)
         if removed:
-            save_schedule(group_id, month_key, schedule)
             msg = f"✅ 已取消 {proxy_name} 在 {'、'.join(removed)} 的登記。\n\n"
-            msg += build_summary_message(group_id)
+            msg += build_summary_message(group_id, current_month_key)
         else:
             msg = f"找不到 {proxy_name} 在指定日期的登記。"
         reply(event.reply_token, msg)
 
+    # 查詢統計（當月或指定月份）
     elif text in ["查詢統計", "出團統計", "羽球統計", "統計"]:
-        reply(event.reply_token, build_summary_message(group_id))
+        reply(event.reply_token, build_summary_message(group_id, current_month_key))
 
+    elif re.match(r'^(查詢統計|出團統計|羽球統計|統計)\s*\d{1,2}月$', text):
+        month_match = re.search(r'(\d{1,2})月', text)
+        target_month = int(month_match.group(1))
+        target_mk = month_key_for(target_month)
+        reply(event.reply_token, build_summary_message(group_id, target_mk))
+
+    # 場地費用（僅當月）
     elif text.startswith("場地費用"):
-        handle_fee_command(event, group_id, text)
+        lines_input = text.split('\n')
+        fee_lines = [l.strip() for l in lines_input[1:] if l.strip()]
+        if not fee_lines:
+            reply(event.reply_token, "請用格式：\n場地費用\n6/2 2030-2230\n6/12 2030-2230")
+            return
 
+        schedule = get_schedule(group_id, current_month_key)
+        fees = get_fees(group_id, current_month_key)
+        result_lines = ["💰 場地費用結算\n"]
+        errors = []
+
+        for line in fee_lines:
+            match = re.match(r'(\d{1,2}/\d{1,2})\s+(\d{4})-(\d{4})', line)
+            if not match:
+                errors.append(f"格式錯誤：{line}")
+                continue
+            date_str, start_str, end_str = match.group(1), match.group(2), match.group(3)
+            if date_str not in schedule or not schedule[date_str]:
+                errors.append(f"{date_str} 沒有人登記出席")
+                continue
+
+            hours = calc_hours(start_str, end_str)
+            if hours <= 0:
+                errors.append(f"{date_str} 時間有誤")
+                continue
+
+            discount = is_discount_slot(date_str, start_str, end_str, current_month_key)
+            rate = COURT_FEE_DISCOUNT if discount else COURT_FEE_NORMAL
+            total = int(rate * hours)
+            names_on_day = schedule[date_str]
+            count = len(names_on_day)
+            per_person = int(total / count)
+
+            if date_str not in fees:
+                fees[date_str] = {}
+            for uid, name in names_on_day.items():
+                fees[date_str][name] = per_person
+
+            tag = "（優惠時段）" if discount else ""
+            result_lines.append(f"{date_str}{tag}")
+            result_lines.append(f"時間：{start_str[:2]}:{start_str[2:]} - {end_str[:2]}:{end_str[2:]}（{int(hours)}小時）")
+            result_lines.append(f"場地費：{total}元（{rate}元/小時）")
+            result_lines.append(f"出席（{count}人）：{' / '.join(names_on_day.values())}")
+            result_lines.append(f"每人：{per_person}元\n")
+
+        save_fees(group_id, current_month_key, fees)
+
+        if errors:
+            result_lines.append("⚠️ 以下無法結算：")
+            result_lines.extend(errors)
+            result_lines.append("")
+
+        total_by_person = {}
+        for day_fees in fees.values():
+            for name, amount in day_fees.items():
+                total_by_person[name] = total_by_person.get(name, 0) + amount
+
+        if total_by_person:
+            result_lines.append("───────────")
+            result_lines.append(f"{int(current_month_key.split('-')[1])}月累計費用")
+            for name, amount in total_by_person.items():
+                result_lines.append(f"{name}：{amount}元")
+
+        reply(event.reply_token, "\n".join(result_lines))
+
+    # 查詢費用（當月）
     elif text in ["查詢費用", "費用統計", "費用"]:
-        handle_query_fee(event, group_id)
+        fees = get_fees(group_id, current_month_key)
+        display_month = int(current_month_key.split('-')[1])
+        if not fees:
+            reply(event.reply_token, f"📊 {display_month}月還沒有費用記錄！")
+            return
 
+        total_by_person = {}
+        lines_out = [f"💰 {display_month}月費用明細\n"]
+
+        def sort_key(d):
+            p = d.split('/')
+            return (int(p[0]), int(p[1]))
+
+        for date_str in sorted(fees.keys(), key=sort_key):
+            day_fees = fees[date_str]
+            lines_out.append(f"{date_str}")
+            for name, amount in day_fees.items():
+                lines_out.append(f"  {name}：{amount}元")
+                total_by_person[name] = total_by_person.get(name, 0) + amount
+        lines_out.append("\n───────────")
+        lines_out.append("本月累計")
+        for name, amount in total_by_person.items():
+            lines_out.append(f"{name}：{amount}元")
+        reply(event.reply_token, "\n".join(lines_out))
+
+    # 群組ID
+    elif text == "群組ID":
+        reply(event.reply_token, f"此群組的 ID 是：\n{group_id}")
+
+    # 重置本月
     elif text == "重置本月":
-        save_schedule(group_id, month_key, {})
-        save_fee(group_id, month_key, {})
+        r.delete(f"schedule:{group_id}:{current_month_key}")
+        r.delete(f"fees:{group_id}:{current_month_key}")
         reply(event.reply_token, "🗑️ 已清除本月所有登記及費用資料。")
+
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 5000))
