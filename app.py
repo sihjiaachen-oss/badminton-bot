@@ -110,6 +110,52 @@ def parse_dates(text):
     pairs = parse_dates_with_month(text)
     return [d for _, d in pairs]
 
+def days_in_month(year, month):
+    if month == 12:
+        next_month_first = datetime(year + 1, 1, 1)
+    else:
+        next_month_first = datetime(year, month + 1, 1)
+    last_day = (next_month_first - __import__('datetime').timedelta(days=1)).day
+    return last_day
+
+def parse_unavailable_dates_with_month(text):
+    """
+    解析「不可以的日期」，回傳 (month_key, [可以的日期字串...])
+    邏輯：找出文字裡指定的月份（沒指定就用當月），
+    再列出該月份扣除提到的日期後，剩下的所有日期
+    """
+    now = datetime.now()
+    current_year = now.year
+    current_month = now.month
+
+    # 判斷文字裡有沒有指定月份
+    cn_month_match = re.search(r'(\d{1,2})月', text)
+    if cn_month_match:
+        month = int(cn_month_match.group(1))
+        mk = month_key_for(month)
+    else:
+        month = current_month
+        mk = get_current_month_key()
+
+    year = int(mk.split('-')[0])
+
+    # 抓出文字裡所有不可以的日期數字
+    # 先移除「N月」這個詞，避免月份數字被誤認成日期
+    text_without_month = re.sub(r'\d{1,2}月', '', text)
+    unavailable_days = set()
+    for d in re.findall(r'\d{1,2}', text_without_month):
+        day = int(d)
+        if 1 <= day <= 31:
+            unavailable_days.add(day)
+
+    total_days = days_in_month(year, month)
+    available_dates = []
+    for day in range(1, total_days + 1):
+        if day not in unavailable_days:
+            available_dates.append(f"{month}/{day}")
+
+    return mk, available_dates
+
 def get_user_display_name(user_id, group_id=None):
     try:
         with ApiClient(configuration) as api_client:
@@ -248,7 +294,7 @@ def remind():
 def handle_message(event):
     if event.source.type != 'group':
         reply(event.reply_token,
-              "🏸 羽球出團小幫手\n\n群組內指令：\n• 我可以的日期 3/13/17 → 登記日期（自動補當月）\n• 我可以的日期 7月5/12 → 登記跨月日期\n• 更正日期 3/13 → 清掉重登（當月）\n• 取消日期 13 → 取消特定日期（當月）\n• 代登記 小王 3/13/17 → 幫人登記\n• 查詢統計 → 查看當月統計\n• 查詢統計 7月 → 查看指定月份統計\n• 場地費用\n  6/2 2030-2230 → 結算費用\n• 查詢費用 → 查看當月費用\n• 重置本月 → 清除當月所有資料\n• 重置 7月 → 清除指定月份資料")
+              "🏸 羽球出團小幫手\n\n群組內指令：\n• 我可以的日期 3/13/17 → 登記日期（自動補當月）\n• 我可以的日期 7月5/12 → 登記跨月日期\n• 我不可以的日期 1/2/4 → 反向登記，扣除指定日期後整月都登記可以\n• 更正日期 3/13 → 清掉重登（當月）\n• 取消日期 13 → 取消特定日期（當月）\n• 代登記 小王 3/13/17 → 幫人登記\n• 查詢統計 → 查看當月統計\n• 查詢統計 7月 → 查看指定月份統計\n• 場地費用\n  6/2 2030-2230 → 結算費用\n• 查詢費用 → 查看當月費用\n• 重置本月 → 清除當月所有資料\n• 重置 7月 → 清除指定月份資料")
         return
 
     group_id = event.source.group_id
@@ -282,6 +328,24 @@ def handle_message(event):
         for mk in sorted(affected_month_keys):
             msg += build_summary_message(group_id, mk) + "\n\n"
         reply(event.reply_token, msg.strip())
+
+    # 我不可以的日期（反向登記：扣除指定日期，其餘整月自動登記為可以）
+    elif "我不可以的日期" in text:
+        idx = text.find("我不可以的日期")
+        date_part = text[idx + len("我不可以的日期"):]
+        mk, available_dates = parse_unavailable_dates_with_month(date_part)
+
+        data = get_schedule(group_id, mk)
+        for d in available_dates:
+            if d not in data:
+                data[d] = {}
+            data[d][user_id] = display_name
+        save_schedule(group_id, mk, data)
+
+        display_month = int(mk.split('-')[1])
+        msg = f"✅ 已記錄 {display_name} 在 {display_month}月除了指定日期外都可以打球！\n\n"
+        msg += build_summary_message(group_id, mk)
+        reply(event.reply_token, msg)
 
     # 更正日期（僅當月）
     elif text.startswith("更正日期"):
