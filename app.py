@@ -251,6 +251,11 @@ def push_message(group_id, text):
 
 # ── Routes ─────────────────────────────────────────────────
 
+@app.route("/health", methods=['GET'])
+def health():
+    return 'OK', 200
+
+
 @app.route("/callback", methods=['POST'])
 def callback():
     signature = request.headers['X-Line-Signature']
