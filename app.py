@@ -287,19 +287,19 @@ def remind():
     if reminder_key not in reminders:
         return 'no reminder today', 200
 
+    time_str = reminders[reminder_key]
+
     # 抓今天登記的出席人員
     data = get_schedule(group_id, month_key)
     if today_str not in data:
-        # 有設提醒但沒人登記，還是發提醒
-        msg = f"🏸 今天 {today_str} 要打球囉！\n（尚無出席登記）"
+        msg = f"🏸 今天 {today_str} 要打球囉！\n時間：{time_str}\n（尚無出席登記）"
         push_message(group_id, msg)
         return 'ok', 200
 
     players = data[today_str]
     names = list(players.values())
-    mentions = [f"@{name}" for name in names]
 
-    msg = f"🏸 今天 {today_str} 要打球囉！\n出席：{' / '.join(names)}\n{' '.join(mentions)}"
+    msg = f"🏸 今天 {today_str} 要打球囉！\n時間：{time_str}\n出席：{' / '.join(names)}"
     push_message(group_id, msg)
     return 'ok', 200
 
@@ -603,28 +603,73 @@ def handle_message(event):
             lines_out.append(f"{name}：{amount}元")
         reply(event.reply_token, "\n".join(lines_out))
 
-    # 設定打球提醒（支援跨月）
+    # 設定打球提醒（支援跨月、多行格式含時間）
     elif text.startswith("設定打球提醒"):
-        date_part = text.replace("設定打球提醒", "").strip()
-        date_pairs = parse_dates_with_month(date_part)
-        if not date_pairs:
-            reply(event.reply_token, "沒有偵測到有效日期！\n請用格式：設定打球提醒 3/17 或 設定打球提醒 7月3/17")
+        lines_input = text.split('\n')
+        first_line = lines_input[0].replace("設定打球提醒", "").strip()
+
+        # 判斷第一行有沒有指定月份
+        month_in_first = re.search(r'(\d{1,2})月', first_line)
+        if month_in_first:
+            base_month = int(month_in_first.group(1))
+            base_mk = month_key_for(base_month)
+        else:
+            base_month = int(get_current_month_key().split('-')[1])
+            base_mk = get_current_month_key()
+        base_year = int(base_mk.split('-')[0])
+
+        detail_lines = [l.strip() for l in lines_input[1:] if l.strip()]
+
+        # 如果沒有換行（單行格式），第一行就是日期
+        if not detail_lines:
+            date_part = first_line
+            date_pairs = parse_dates_with_month(date_part) if date_part else []
+            if not date_pairs:
+                reply(event.reply_token, "請用格式：\n設定打球提醒 7月\n3/17 1830-2030\n20 2030-2230")
+                return
+            reminders = get_reminders(group_id)
+            added = []
+            for mk, d in date_pairs:
+                year = mk.split('-')[0]
+                rk = f"{year}/{d}"
+                reminders[rk] = "（未設定時間）"
+                added.append(d)
+            save_reminders(group_id, reminders)
+            display_list = [f"{'/'.join(k.split('/')[1:])} {v}" for k, v in sorted(reminders.items())]
+            reply(event.reply_token, f"✅ 已設定提醒！\n\n目前提醒日期：\n" + "\n".join(display_list))
             return
+
         reminders = get_reminders(group_id)
         added = []
-        for mk, d in date_pairs:
-            # 提醒存成「年/月/日」格式避免跨年衝突
-            year = mk.split('-')[0]
-            reminder_key = f"{year}/{d}"
-            if reminder_key not in reminders:
-                reminders.append(reminder_key)
-                added.append(d)
-        reminders.sort(key=lambda x: (int(x.split('/')[0]), int(x.split('/')[1]), int(x.split('/')[2])))
+
+        for line in detail_lines:
+            # 解析時間 hhmm-hhmm
+            time_match = re.search(r'(\d{4})-(\d{4})', line)
+            if not time_match:
+                continue
+            start_str, end_str = time_match.group(1), time_match.group(2)
+            time_display = f"{start_str[:2]}:{start_str[2:]}-{end_str[:2]}:{end_str[2:]}"
+
+            # 移除時間部分，剩下的是日期
+            date_part = re.sub(r'\d{4}-\d{4}', '', line).strip()
+
+            # 解析日期（可能是「3/17」或純數字「20」）
+            day_nums = re.findall(r'\d{1,2}', date_part)
+            for d in day_nums:
+                day = int(d)
+                if 1 <= day <= 31:
+                    try:
+                        datetime(base_year, base_month, day)
+                        date_str = f"{base_month}/{day}"
+                        rk = f"{base_year}/{date_str}"
+                        reminders[rk] = time_display
+                        added.append(f"{date_str} {time_display}")
+                    except ValueError:
+                        pass
+
         save_reminders(group_id, reminders)
-        dates_display = '、'.join(added)
-        # 顯示時只顯示月/日
-        display_list = ['/'.join(x.split('/')[1:]) for x in reminders]
-        reply(event.reply_token, f"✅ 已設定 {dates_display} 當天早上 11 點發打球提醒！\n\n目前提醒日期：{'、'.join(display_list)}")
+        display_list = [f"{'/'.join(k.split('/')[1:])} {v}" for k, v in sorted(reminders.items())]
+        reply(event.reply_token, f"✅ 已設定以下打球提醒：\n" + "\n".join(added) + f"\n\n目前所有提醒：\n" + "\n".join(display_list))
 
     # 取消打球提醒（支援跨月）
     elif text.startswith("取消打球提醒"):
@@ -637,16 +682,16 @@ def handle_message(event):
         removed = []
         for mk, d in date_pairs:
             year = mk.split('-')[0]
-            reminder_key = f"{year}/{d}"
-            if reminder_key in reminders:
-                reminders.remove(reminder_key)
+            rk = f"{year}/{d}"
+            if rk in reminders:
+                del reminders[rk]
                 removed.append(d)
         save_reminders(group_id, reminders)
-        display_list = ['/'.join(x.split('/')[1:]) for x in reminders]
         if removed:
             msg = f"✅ 已取消 {'、'.join(removed)} 的打球提醒。"
             if reminders:
-                msg += f"\n\n目前提醒日期：{'、'.join(display_list)}"
+                display_list = [f"{'/'.join(k.split('/')[1:])} {v}" for k, v in sorted(reminders.items())]
+                msg += f"\n\n目前提醒日期：\n" + "\n".join(display_list)
             else:
                 msg += "\n\n目前沒有設定任何提醒。"
         else:
@@ -659,8 +704,8 @@ def handle_message(event):
         if not reminders:
             reply(event.reply_token, "目前沒有設定任何打球提醒。")
         else:
-            display_list = ['/'.join(x.split('/')[1:]) for x in reminders]
-            reply(event.reply_token, f"📅 目前設定的打球提醒日期：\n{'、'.join(display_list)}")
+            display_list = [f"{'/'.join(k.split('/')[1:])} {v}" for k, v in sorted(reminders.items())]
+            reply(event.reply_token, f"📅 目前設定的打球提醒：\n" + "\n".join(display_list))
 
     # 群組ID
     elif text == "群組ID":
