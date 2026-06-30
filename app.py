@@ -608,7 +608,7 @@ def handle_message(event):
         lines_input = text.split('\n')
         first_line = lines_input[0].replace("設定打球提醒", "").strip()
 
-        # 判斷第一行有沒有指定月份
+        # 判斷第一行有沒有指定月份（有沒有空格都支援）
         month_in_first = re.search(r'(\d{1,2})月', first_line)
         if month_in_first:
             base_month = int(month_in_first.group(1))
@@ -653,10 +653,12 @@ def handle_message(event):
             # 移除時間部分，剩下的是日期
             date_part = re.sub(r'\d{4}-\d{4}', '', line).strip()
 
-            # 解析日期（可能是「3/17」或純數字「20」）
+            # 解析日期：支援 3/17/20/27 或純數字 3 17 20 或混合
+            # 先把所有斜線、空格、頓號、逗號都當分隔符，抓出所有數字
             day_nums = re.findall(r'\d{1,2}', date_part)
             for d in day_nums:
                 day = int(d)
+                # 過濾掉不合理的日期（例如月份數字被誤抓）
                 if 1 <= day <= 31:
                     try:
                         datetime(base_year, base_month, day)
