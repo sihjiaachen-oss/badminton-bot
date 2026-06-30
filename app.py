@@ -488,16 +488,26 @@ def handle_message(event):
         target_mk = month_key_for(target_month)
         reply(event.reply_token, build_summary_message(group_id, target_mk))
 
-    # 場地費用（僅當月）
+    # 場地費用（支援指定月份）
     elif text.startswith("場地費用"):
         lines_input = text.split('\n')
+        first_line = lines_input[0].strip()
+
+        # 判斷第一行有沒有指定月份，例如「場地費用 7月」
+        month_in_first = re.search(r'(\d{1,2})月', first_line)
+        if month_in_first:
+            target_month = int(month_in_first.group(1))
+            target_mk = month_key_for(target_month)
+        else:
+            target_mk = current_month_key
+
         fee_lines = [l.strip() for l in lines_input[1:] if l.strip()]
         if not fee_lines:
-            reply(event.reply_token, "請用格式：\n場地費用\n6/2 2030-2230\n6/12 2030-2230")
+            reply(event.reply_token, "請用格式：\n場地費用\n6/2 2030-2230\n\n或指定月份：\n場地費用 7月\n7/3 2030-2230")
             return
 
-        schedule = get_schedule(group_id, current_month_key)
-        fees = get_fees(group_id, current_month_key)
+        schedule = get_schedule(group_id, target_mk)
+        fees = get_fees(group_id, target_mk)
         result_lines = ["💰 場地費用結算\n"]
         errors = []
 
@@ -516,7 +526,7 @@ def handle_message(event):
                 errors.append(f"{date_str} 時間有誤")
                 continue
 
-            discount = is_discount_slot(date_str, start_str, end_str, current_month_key)
+            discount = is_discount_slot(date_str, start_str, end_str, target_mk)
             rate = COURT_FEE_DISCOUNT if discount else COURT_FEE_NORMAL
             total = int(rate * hours)
             names_on_day = schedule[date_str]
@@ -535,7 +545,7 @@ def handle_message(event):
             result_lines.append(f"出席（{count}人）：{' / '.join(names_on_day.values())}")
             result_lines.append(f"每人：{per_person}元\n")
 
-        save_fees(group_id, current_month_key, fees)
+        save_fees(group_id, target_mk, fees)
 
         if errors:
             result_lines.append("⚠️ 以下無法結算：")
@@ -549,7 +559,7 @@ def handle_message(event):
 
         if total_by_person:
             result_lines.append("───────────")
-            result_lines.append(f"{int(current_month_key.split('-')[1])}月累計費用")
+            result_lines.append(f"{int(target_mk.split('-')[1])}月累計費用")
             for name, amount in total_by_person.items():
                 result_lines.append(f"{name}：{amount}元")
 
