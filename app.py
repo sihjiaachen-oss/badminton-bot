@@ -274,15 +274,26 @@ def remind():
 
     today = datetime.now()
     today_str = f"{today.month}/{today.day}"
-    month_key = get_current_month_key()  # 提醒永遠抓「今天」所屬的月份
+    month_key = get_current_month_key()
     group_id = LINE_GROUP_ID
 
     if not group_id:
         return 'no group id', 200
 
+    # 檢查今天是否在「設定打球提醒」名單裡
+    reminders = get_reminders(group_id)
+    year_str = str(today.year)
+    reminder_key = f"{year_str}/{today_str}"
+    if reminder_key not in reminders:
+        return 'no reminder today', 200
+
+    # 抓今天登記的出席人員
     data = get_schedule(group_id, month_key)
     if today_str not in data:
-        return 'no event today', 200
+        # 有設提醒但沒人登記，還是發提醒
+        msg = f"🏸 今天 {today_str} 要打球囉！\n（尚無出席登記）"
+        push_message(group_id, msg)
+        return 'ok', 200
 
     players = data[today_str]
     names = list(players.values())
@@ -299,7 +310,7 @@ def remind():
 def handle_message(event):
     if event.source.type != 'group':
         reply(event.reply_token,
-              "🏸 羽球出團小幫手\n\n群組內指令：\n• 我可以的日期 3/13/17 → 登記日期（自動補當月）\n• 我可以的日期 7月5/12 → 登記跨月日期\n• 我不可以的日期 1/2/4 → 反向登記，扣除指定日期後整月都登記可以\n• 更正日期 3/13 → 清掉重登（當月）\n• 取消日期 13 → 取消特定日期（當月）\n• 代登記 小王 3/13/17 → 幫人登記\n• 查詢統計 → 查看當月統計\n• 查詢統計 7月 → 查看指定月份統計\n• 場地費用\n  6/2 2030-2230 → 結算費用\n• 查詢費用 → 查看當月費用\n• 重置本月 → 清除當月所有資料\n• 重置 7月 → 清除指定月份資料")
+              "🏸 羽球出團小幫手\n\n群組內指令：\n• 我可以的日期 3/13/17 → 登記日期（自動補當月）\n• 我可以的日期 7月5/12 → 登記跨月日期\n• 我不可以的日期 1/2/4 → 反向登記，扣除指定日期後整月都登記可以\n• 更正日期 3/13 → 清掉重登（當月）\n• 取消日期 13 → 取消特定日期（當月）\n• 代登記 小王 3/13/17 → 幫人登記\n• 查詢統計 → 查看當月統計\n• 查詢統計 7月 → 查看指定月份統計\n• 場地費用\n  6/2 2030-2230 → 結算費用\n• 查詢費用 → 查看當月費用\n• 重置本月 → 清除當月所有資料\n• 重置 7月 → 清除指定月份資料\n• 設定打球提醒 7/3 7/17 → 設定當天提醒\n• 取消打球提醒 7/3 → 取消提醒\n• 查詢打球提醒 → 查看所有提醒日期")
         return
 
     group_id = event.source.group_id
@@ -591,6 +602,65 @@ def handle_message(event):
         for name, amount in total_by_person.items():
             lines_out.append(f"{name}：{amount}元")
         reply(event.reply_token, "\n".join(lines_out))
+
+    # 設定打球提醒（支援跨月）
+    elif text.startswith("設定打球提醒"):
+        date_part = text.replace("設定打球提醒", "").strip()
+        date_pairs = parse_dates_with_month(date_part)
+        if not date_pairs:
+            reply(event.reply_token, "沒有偵測到有效日期！\n請用格式：設定打球提醒 3/17 或 設定打球提醒 7月3/17")
+            return
+        reminders = get_reminders(group_id)
+        added = []
+        for mk, d in date_pairs:
+            # 提醒存成「年/月/日」格式避免跨年衝突
+            year = mk.split('-')[0]
+            reminder_key = f"{year}/{d}"
+            if reminder_key not in reminders:
+                reminders.append(reminder_key)
+                added.append(d)
+        reminders.sort(key=lambda x: (int(x.split('/')[0]), int(x.split('/')[1]), int(x.split('/')[2])))
+        save_reminders(group_id, reminders)
+        dates_display = '、'.join(added)
+        # 顯示時只顯示月/日
+        display_list = ['/'.join(x.split('/')[1:]) for x in reminders]
+        reply(event.reply_token, f"✅ 已設定 {dates_display} 當天早上 11 點發打球提醒！\n\n目前提醒日期：{'、'.join(display_list)}")
+
+    # 取消打球提醒（支援跨月）
+    elif text.startswith("取消打球提醒"):
+        date_part = text.replace("取消打球提醒", "").strip()
+        date_pairs = parse_dates_with_month(date_part)
+        if not date_pairs:
+            reply(event.reply_token, "沒有偵測到有效日期！\n請用格式：取消打球提醒 7/3 或 取消打球提醒 7月3")
+            return
+        reminders = get_reminders(group_id)
+        removed = []
+        for mk, d in date_pairs:
+            year = mk.split('-')[0]
+            reminder_key = f"{year}/{d}"
+            if reminder_key in reminders:
+                reminders.remove(reminder_key)
+                removed.append(d)
+        save_reminders(group_id, reminders)
+        display_list = ['/'.join(x.split('/')[1:]) for x in reminders]
+        if removed:
+            msg = f"✅ 已取消 {'、'.join(removed)} 的打球提醒。"
+            if reminders:
+                msg += f"\n\n目前提醒日期：{'、'.join(display_list)}"
+            else:
+                msg += "\n\n目前沒有設定任何提醒。"
+        else:
+            msg = "找不到指定日期的提醒設定。"
+        reply(event.reply_token, msg)
+
+    # 查詢打球提醒
+    elif text == "查詢打球提醒":
+        reminders = get_reminders(group_id)
+        if not reminders:
+            reply(event.reply_token, "目前沒有設定任何打球提醒。")
+        else:
+            display_list = ['/'.join(x.split('/')[1:]) for x in reminders]
+            reply(event.reply_token, f"📅 目前設定的打球提醒日期：\n{'、'.join(display_list)}")
 
     # 群組ID
     elif text == "群組ID":
