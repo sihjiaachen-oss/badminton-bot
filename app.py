@@ -38,6 +38,16 @@ def save_schedule(group_id, month_key, data):
     key = f"schedule:{group_id}:{month_key}"
     r.set(key, json.dumps(data, ensure_ascii=False))
 
+def get_reminders(group_id):
+    """回傳 dict: { "2026/7/3": "18:30-20:30", ... }"""
+    key = f"reminders:{group_id}"
+    val = r.get(key)
+    return json.loads(val) if val else {}
+
+def save_reminders(group_id, data):
+    key = f"reminders:{group_id}"
+    r.set(key, json.dumps(data, ensure_ascii=False))
+
 def get_fees(group_id, month_key):
     key = f"fees:{group_id}:{month_key}"
     val = r.get(key)
